@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>我的 AI</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:15px system-ui,sans-serif;color:#20252b;background:#fff}
+button,input,textarea,select{font:inherit}button{cursor:pointer;border:1px solid #d8dde3;background:#fff;border-radius:6px;padding:9px 12px;color:inherit}
+button:disabled{opacity:.45;cursor:default}button:focus-visible{outline:2px solid #167365}
+header{height:58px;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #e4e7eb}
+header strong{flex:1;font-size:18px}main{height:calc(100dvh - 58px);display:flex;flex-direction:column}
+#messages{flex:1;overflow:auto;padding:16px max(16px,calc((100% - 820px)/2));overscroll-behavior:contain}
+.message{margin:0 0 22px;min-width:0}.role{font-size:12px;color:#66717d;margin-bottom:6px}
+.content{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.message img{max-width:100%;max-height:360px;object-fit:contain;border-radius:6px}
+details{margin:8px 0;color:#66717d;font-size:14px}summary{cursor:pointer}details .content{padding-top:8px}
+footer{border-top:1px solid #e4e7eb;padding:10px max(12px,calc((100% - 820px)/2)) max(10px,env(safe-area-inset-bottom));background:#fff}
+#composer{display:flex;align-items:flex-end;gap:8px}#text{flex:1;min-width:0;height:70px;max-height:180px;resize:vertical;padding:10px;border:1px solid #ccd3db;border-radius:6px}
+.primary{background:#167365;color:#fff;border-color:#167365}#status{font-size:12px;color:#64717d;min-height:20px;padding-top:5px;overflow-wrap:anywhere}
+#previews{display:flex;gap:8px;overflow:auto;margin-bottom:8px}#previews:empty{display:none}
+.preview{position:relative;flex:none}.preview img{width:70px;height:70px;object-fit:cover;border-radius:6px}.preview button{position:absolute;right:0;top:0;padding:0;width:24px;height:24px}
+dialog{width:min(94vw,520px);max-height:85dvh;overflow:auto;border:1px solid #d8dde3;border-radius:8px;padding:20px}dialog::backdrop{background:#0005}
+label{display:block;font-size:13px;margin:14px 0 6px}dialog input,dialog textarea{width:100%;padding:10px;border:1px solid #ccd3db;border-radius:6px}
+dialog textarea{min-height:100px}.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+#sessionList{list-style:none;padding:0}#sessionList li{display:flex;gap:8px;margin:8px 0}#sessionList li button:first-child{flex:1;text-align:left;overflow-wrap:anywhere}
+#notice{font-size:12px;color:#66717d;line-height:1.6}@media(max-width:430px){header{gap:5px}header button{padding:8px}#composer{gap:5px}#composer button{padding:10px 8px}}
+</style>
+</head>
+<body>
+<header>
+<strong>我的 AI</strong>
+<button id="history">会话</button>
+<button id="new">新建</button>
+<button id="settings">设置</button>
+</header>
+<main>
+<div id="messages" aria-live="polite"></div>
+<footer>
+<div id="previews"></div>
+<div id="composer">
+<button id="attach" title="上传图片" aria-label="上传图片">＋</button>
+<textarea id="text" placeholder="输入消息…" aria-label="消息"></textarea>
+<button id="send" class="primary">发送</button>
+<button id="stop" hidden>停止</button>
+</div>
+<div id="status" role="status"></div>
+</footer>
+</main>
+<input id="files" type="file" accept="image/*" multiple hidden>
+<dialog id="config">
+<h2>接口设置</h2>
+<label for="base">API 地址</label>
+<input id="base" placeholder="https://api.example.com/v1" type="url">
+<label for="key">API 密钥</label>
+<input id="key" type="password" autocomplete="off" placeholder="sk-…">
+<label for="model">模型名称</label>
+<input id="model" placeholder="填写服务商的模型 ID">
+<label for="prompt">固定提示词</label>
+<textarea id="prompt" placeholder="分析图片中的英语试题，逐题给出答案和依据。"></textarea>
+<p id="notice">配置和密钥保存在本机浏览器。图片及消息会发送给你配置的 API 服务商。不要在公共设备上记住密钥。</p>
+<div class="actions"><button id="closeConfig">取消</button><button id="saveConfig" class="primary">保存</button></div>
+</dialog>
+<dialog id="sessions">
+<h2>聊天记录</h2>
+<ul id="sessionList"></ul>
+<div class="actions"><button id="export">导出全部</button><button id="closeSessions">关闭</button></div>
+</dialog>
+<script>
+const $=id=>document.getElementById(id);
+let db,state={current:null,chats:[]},cfg={},pending=[],controller=null,busy=false,uploading=false,saveQueue=Promise.resolve();
+const storageKey="my-ai-config-v1";
+function status(text){$("status").textContent=text}
+function current(){return state.chats.find(c=>c.id===state.current)}
+function save(){
+ const snapshot=structuredClone(state);
+ saveQueue=saveQueue.catch(()=>{}).then(()=>new Promise((resolve,reject)=>{
+  const tx=db.transaction("data","readwrite");
+  tx.objectStore("data").put(snapshot,"state");
+  tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);
+ }));
+ return saveQueue;
+}
+function newChat(){
+ const chat={id:crypto.randomUUID(),title:"新对话",messages:[],prompt:cfg.prompt||""};
+ state.chats.unshift(chat);state.current=chat.id;pending=[];previews();render();
+ save().catch(()=>status("保存失败，请导出备份"));
+}
+function render(){
+ const root=$("messages");root.replaceChildren();
+ for(const m of current()?.messages||[]){
+  const block=document.createElement("section");block.className="message";
+  const role=document.createElement("div");role.className="role";role.textContent=m.role==="user"?"你":"AI";block.append(role);
+  for(const image of m.images||[]){const img=document.createElement("img");img.src=image;img.alt="上传图片";block.append(img)}
+  if(m.reasoning){const d=document.createElement("details"),s=document.createElement("summary"),c=document.createElement("div");
+   s.textContent="思考内容";c.className="content";c.textContent=m.reasoning;d.append(s,c);block.append(d)}
+  const content=document.createElement("div");content.className="content";content.textContent=m.text||"";block.append(content);
+  if(m.error){const e=document.createElement("div");e.className="role";e.textContent=m.error;block.append(e)}
+  root.append(block);
+ }
+ root.scrollTop=root.scrollHeight;
+}
+function previews(){
+ $("previews").replaceChildren();
+ pending.forEach((src,i)=>{
+  const wrap=document.createElement("div");wrap.className="preview";
+  const img=document.createElement("img");img.src=src;img.alt="待发送图片";
+  const remove=document.createElement("button");remove.textContent="×";remove.title="移除图片";remove.disabled=busy||uploading;
+  remove.onclick=()=>{pending.splice(i,1);previews()};wrap.append(img,remove);$("previews").append(wrap);
+ });
+}
+function controls(){
+ $("send").disabled=busy||uploading;$("stop").hidden=!busy;
+ for(const id of ["new","history","settings","attach"])$(id).disabled=busy||uploading;
+ previews();
+}
+async function compress(file){
+ const url=URL.createObjectURL(file),img=new Image();
+ try{
+  img.src=url;await img.decode();
+  const scale=Math.min(1,1800/Math.max(img.naturalWidth,img.naturalHeight));
+  const canvas=document.createElement("canvas");canvas.width=Math.round(img.naturalWidth*scale);canvas.height=Math.round(img.naturalHeight*scale);
+  const ctx=canvas.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,canvas.width,canvas.height);ctx.drawImage(img,0,0,canvas.width,canvas.height);
+  return canvas.toDataURL("image/jpeg",.85);
+ }finally{URL.revokeObjectURL(url)}
+}
+$("attach").onclick=()=>$("files").click();
+$("files").onchange=async event=>{
+ uploading=true;controls();status("处理图片…");
+ try{
+  for(const file of event.target.files){
+   if(pending.length>=6)throw Error("一次最多上传 6 张图片");
+   if(file.size>20*1024*1024)throw Error("单张图片不能超过 20 MB");
+   pending.push(await compress(file));
+  }
+  status("");
+ }catch(e){status(e.message)}finally{uploading=false;event.target.value="";controls()}
+};
+function requestMessages(chat){
+ const messages=[];
+ if(chat.prompt)messages.push({role:"system",content:chat.prompt});
+ for(const m of chat.messages){
+  if(m.role==="assistant"&&!m.text)continue;
+  const content=m.images?.length?[{type:"text",text:m.text||"请按照固定提示词分析图片。"},...m.images.map(url=>({type:"image_url",image_url:{url}}))]:m.text;
+  messages.push({role:m.role,content});
+ }
+ return messages;
+}
+async function stream(response,message){
+ const reader=response.body.getReader(),decoder=new TextDecoder();let buffer="",data=[],done=false;
+ function dispatch(){
+  if(!data.length)return;const raw=data.join("\n");data=[];
+  if(raw==="[DONE]"){done=true;return}
+  const obj=JSON.parse(raw);if(obj.error)throw Error(obj.error.message||"接口返回错误");
+  const delta=obj.choices?.[0]?.delta;
+  if(typeof delta?.content==="string")message.text+=delta.content;
+  if(typeof delta?.reasoning_content==="string")message.reasoning+=delta.reasoning_content;
+  render();
+ }
+ function consume(final=false){
+  let pos;
+  while((pos=buffer.indexOf("\n"))!==-1){
+   const line=buffer.slice(0,pos).replace(/\r$/,"");buffer=buffer.slice(pos+1);
+   if(!line)dispatch();else if(line.startsWith("data:"))data.push(line.slice(5).replace(/^ /,""));
+  }
+  if(final){if(buffer.startsWith("data:"))data.push(buffer.slice(5).trimStart());dispatch()}
+ }
+ try{
+  while(!done){const chunk=await reader.read();if(chunk.done){buffer+=decoder.decode();consume(true);break}
+   buffer+=decoder.decode(chunk.value,{stream:true});consume()}
+ }finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
+}
+async function send(){
+ if(busy||uploading)return;
+ const text=$("text").value.trim();if(!text&&!pending.length)return;
+ if(!cfg.base||!cfg.key||!cfg.model){$("settings").click();return}
+ let endpoint;
+ try{
+  const url=new URL(cfg.base);if(!["https:","http:"].includes(url.protocol))throw Error("地址必须使用 HTTPS 或 HTTP");
+  endpoint=cfg.base.replace(/\/+$/,"");if(!endpoint.endsWith("/chat/completions"))endpoint+="/chat/completions";
+ }catch(e){status("API 地址无效："+e.message);return}
+ const chat=current();if(!chat.messages.length){chat.title=text.slice(0,28)||"图片分析";chat.prompt=cfg.prompt||""}
+ chat.messages.push({role:"user",text,images:[...pending]});
+ const messages=requestMessages(chat),answer={role:"assistant",text:"",reasoning:""};
+ chat.messages.push(answer);pending=[];$("text").value=
